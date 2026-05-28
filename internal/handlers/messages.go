@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"oc-go-cc/internal/client"
@@ -53,7 +52,8 @@ func (w *responseWriter) WriteHeader(code int) {
 
 func (w *responseWriter) Write(b []byte) (int, error) {
 	if !w.wroteHeader {
-		w.WriteHeader(http.StatusOK)
+		w.wroteHeader = true
+		w.ResponseWriter.WriteHeader(http.StatusOK)
 	}
 	return w.ResponseWriter.Write(b)
 }
@@ -228,49 +228,13 @@ func (h *MessagesHandler) handleStreaming(
 
 	rw := &responseWriter{ResponseWriter: w}
 
-	// Set SSE headers immediately so Claude Code knows the stream is alive.
-	// This prevents client-side timeouts before we even start sending data.
+	// Set SSE headers but defer WriteHeader(200) until the first
+	// upstream byte arrives.  If all models fail we return HTTP 503
+	// which the SDK retries on; no SSE error event is ever sent.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
-	rw.WriteHeader(http.StatusOK)
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-
-	// Start heartbeat to keep connection alive while waiting for upstream.
-	// Claude Code times out after ~6 seconds of no data, so we send pings every 3 seconds
-	// (frequent enough to prevent timeout, not so frequent as to cause overhead).
-	var finished int32
-	heartbeatDone := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(3 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				if atomic.LoadInt32(&finished) == 1 {
-					return
-				}
-				// Send SSE comment (ignored by client but keeps connection alive)
-				_, _ = fmt.Fprintf(rw, ":keepalive\n\n")
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush()
-				}
-			case <-heartbeatDone:
-				return
-			case <-clientCtx.Done():
-				return
-			}
-		}
-	}()
-	// Stop heartbeat when streaming completes
-	defer func() {
-		atomic.StoreInt32(&finished, 1)
-		close(heartbeatDone)
-	}()
 
 	streamStart := time.Now()
 
@@ -357,14 +321,11 @@ func (h *MessagesHandler) handleStreaming(
 		return
 	}
 
-	// All models failed
+	// All models failed.  No headers were written, so we can return a
+	// proper HTTP 503 with Retry-After — the SDK retries on 5xx errors.
 	h.metrics.RecordFailure()
-	if !rw.wroteHeader {
-		h.sendError(w, http.StatusBadGateway, "all streaming models failed", nil)
-	} else {
-		// Headers already sent - send error as SSE event
-		h.sendStreamError(rw, "all upstream models failed")
-	}
+	w.Header().Set("Retry-After", "5")
+	h.sendError(w, http.StatusServiceUnavailable, "all streaming models failed", nil)
 }
 
 // replaceModelInRawBody replaces the model field in raw JSON body with the actual model ID.
@@ -438,7 +399,7 @@ func (h *MessagesHandler) sendStreamError(w http.ResponseWriter, message string)
 	errorEvent := map[string]interface{}{
 		"type": "error",
 		"error": map[string]interface{}{
-			"type":    "api_error",
+			"type":    "overloaded_error",
 			"message": message,
 		},
 	}
@@ -477,7 +438,8 @@ func (h *MessagesHandler) handleNonStreaming(
 
 	if err != nil {
 		h.metrics.RecordFailure()
-		h.sendError(w, http.StatusBadGateway, "all models failed", err)
+		w.Header().Set("Retry-After", "5")
+		h.sendError(w, http.StatusServiceUnavailable, "all models failed", err)
 		return
 	}
 
@@ -580,6 +542,9 @@ func (h *MessagesHandler) sendError(w http.ResponseWriter, statusCode int, messa
 		return
 	}
 
+	if statusCode == http.StatusServiceUnavailable {
+		w.Header().Set("Retry-After", "5")
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 
