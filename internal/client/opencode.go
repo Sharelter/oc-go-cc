@@ -184,11 +184,11 @@ func (c *OpenCodeClient) SendAnthropicRequest(
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Set headers
+	// Set headers.  MiniMax requires x-api-key (no Authorization header);
+	// OpenCode Go accepts either.  Sending only x-api-key works for both.
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
-	// Incase OpenCode Go expects x-api-key instead
 	httpReq.Header.Set("x-api-key", apiKey)
+	httpReq.Header.Set("anthropic-version", "2023-06-01")
 
 	// Add streaming header if requested
 	if stream {
